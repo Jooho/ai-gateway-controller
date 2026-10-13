@@ -178,17 +178,17 @@ func (r *Reconciler) reconcileAttachedModel(ctx context.Context, model *v1alpha1
 
 	var result reconcile.Result
 	var errs []error
+	var homeErr error
 	results := make([]attachmentResult, len(targets))
 	homeReported := false
 	if home >= 0 {
-		var err error
-		result, err = r.reconcileHomeModel(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}, model, func(ready bool, reason, message string, env *envelope.Envelope) error {
+		result, homeErr = r.reconcileHomeModel(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}, model, func(ready bool, reason, message string, env *envelope.Envelope) error {
 			homeReported = true
 			results[home] = attachmentResult{gateway: targets[home].result.gateway, ready: ready, reason: reason, message: message, routeName: modelRouteName(model.Name), env: env}
 			return nil
 		})
-		if err != nil {
-			errs = append(errs, err)
+		if homeErr != nil {
+			errs = append(errs, homeErr)
 		}
 	}
 
@@ -221,7 +221,11 @@ func (r *Reconciler) reconcileAttachedModel(ctx context.Context, model *v1alpha1
 		// selection (cleanup), a requeue for a changing tenant, or an error.
 		results[home] = attachmentResult{gateway: targets[home].result.gateway, reason: reasonTenantNotPraxis,
 			message: "the model's own tenant does not select Praxis"}
-		if result.Requeue || result.RequeueAfter > 0 || len(errs) > 0 { //nolint:staticcheck // the home path's existing requeue signal
+		switch {
+		case homeErr != nil:
+			// Only the home path's own error; other attachments report theirs.
+			results[home] = failedAttachment(attachmentResult{gateway: targets[home].result.gateway}, homeErr)
+		case result.Requeue || result.RequeueAfter > 0: //nolint:staticcheck // the home path's existing requeue signal
 			results[home].pending, results[home].reason = true, reasonTenantNotSteady
 			results[home].message = "the model's own tenant is not steady"
 		}

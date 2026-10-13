@@ -260,7 +260,7 @@ doc comment for the full state machine this mirrors. In short:
 serves a model through explicitly selected tenant Gateways, including models in
 user namespaces and models shared by several tenants
 (`pkg/controller/attachment.go`). The contract is the RHOAIENG-90800
-compatibility one pager; this records how it is implemented.
+compatibility one-pager; this records how it is implemented.
 
 - **Home attachment.** The tenant whose `MaasTenantConfig` is in the model
   namespace serves the model when `gatewayRefs` is omitted or names its

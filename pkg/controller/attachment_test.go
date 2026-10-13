@@ -239,3 +239,48 @@ func TestUnservedHomeAttachmentBlocksAggregateReady(t *testing.T) {
 		t.Fatalf("status = %q/%q, want the unserved home attachment reported", got.Status.Phase, readyReason(got))
 	}
 }
+
+// failingTenantReader fails live reads of one tenant's MaasTenantConfig, as
+// an unavailable API server would.
+type failingTenantReader struct {
+	client.Reader
+	namespace string
+}
+
+func (f failingTenantReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == tenant.MaasTenantConfigGVK.Kind && key.Namespace == f.namespace {
+		return apierrors.NewServiceUnavailable("etcd is unavailable")
+	}
+	return f.Reader.Get(ctx, key, obj, opts...)
+}
+
+func TestHomeAttachmentReportsOnlyItsOwnFailure(t *testing.T) {
+	gatewayA := v1alpha1.NamespacedObjectReference{Name: "gw-a", Namespace: "gateway-a"}
+	provider, secret := attachmentProvider("tenant-a")
+	model := attachmentModel("chat", "tenant-a", "chat-model", time.Unix(100, 0), gatewayA, gatewayB)
+	objects := []client.Object{provider, secret, model}
+	objects = append(objects, attachmentTenantObjects("tenant-a", "tenant-a", gatewayA, "ipp")...)
+	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reader := r.APIReader
+	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+
+	// Another attachment's failure does not relabel the home attachment.
+	r.APIReader = failingTenantReader{Reader: reader, namespace: "tenant-b"}
+	if _, err := r.Reconcile(context.Background(), request); err == nil {
+		t.Fatal("a failed tenant read must be retried")
+	}
+	if got := getModel(t, r, model); readyReason(got) != reasonTenantNotPraxis {
+		t.Fatalf("reason = %q, want the home attachment's own %q", readyReason(got), reasonTenantNotPraxis)
+	}
+
+	// The home path's own failure is reported as a failure, not a tenant state.
+	r.APIReader = failingTenantReader{Reader: reader, namespace: "tenant-a"}
+	if _, err := r.Reconcile(context.Background(), request); err == nil {
+		t.Fatal("a failed tenant read must be retried")
+	}
+	got := getModel(t, r, model)
+	if readyReason(got) != reasonReconcileFailed || got.Status.Phase != modelPhaseFailed {
+		t.Fatalf("status = %q/%q, want %q", got.Status.Phase, readyReason(got), reasonReconcileFailed)
+	}
+}
