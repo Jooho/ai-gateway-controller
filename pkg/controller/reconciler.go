@@ -614,6 +614,16 @@ func (r *Reconciler) reconcileDeletedModel(ctx context.Context, deleted *v1alpha
 }
 
 func (r *Reconciler) reconcileDeletedModelWithIdentity(ctx context.Context, deleted *v1alpha1.ExternalModel, tenantID, gatewayName, gatewayNamespace string) error {
+	if err := r.republishHomeWithout(ctx, deleted, tenantID, gatewayName, gatewayNamespace); err != nil {
+		return err
+	}
+	return r.removeExternalModelFinalizer(ctx, deleted)
+}
+
+// republishHomeWithout republishes the tenant's own serving state without the
+// given model: its deletion, or its gatewayRefs no longer naming its own
+// tenant. Only the final served model may remove the shared serving state.
+func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1.ExternalModel, tenantID, gatewayName, gatewayNamespace string) error {
 	var models v1alpha1.ExternalModelList
 	if err := r.List(ctx, &models, client.InNamespace(deleted.Namespace)); err != nil {
 		return fmt.Errorf("list remaining ExternalModels for deletion: %w", err)
@@ -655,10 +665,7 @@ func (r *Reconciler) reconcileDeletedModelWithIdentity(ctx context.Context, dele
 		if err := r.cleanupTransport(ctx, deleted.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
 			return err
 		}
-		if err := r.cleanupOverlay(ctx, deleted.Namespace); err != nil {
-			return err
-		}
-		return r.removeExternalModelFinalizer(ctx, deleted)
+		return r.cleanupOverlay(ctx, deleted.Namespace)
 	}
 	if err != nil {
 		return fmt.Errorf("resolve remaining ExternalModels after deletion: %w", err)
@@ -693,7 +700,7 @@ func (r *Reconciler) reconcileDeletedModelWithIdentity(ctx context.Context, dele
 	}); err != nil {
 		return fmt.Errorf("publish remaining overlay after ExternalModel deletion: %w", err)
 	}
-	return r.removeExternalModelFinalizer(ctx, deleted)
+	return nil
 }
 
 func (r *Reconciler) removeExternalModelFinalizer(ctx context.Context, model *v1alpha1.ExternalModel) error {

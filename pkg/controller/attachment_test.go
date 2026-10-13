@@ -101,8 +101,6 @@ func getUnstructured(r *Reconciler, gvk schema.GroupVersionKind, namespace, name
 
 var destinationRuleGVK = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"}
 
-var httpRouteGVK = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"}
-
 func overlayEnvelope(t *testing.T, r *Reconciler, namespace string) envelope.Envelope {
 	t.Helper()
 	var cm corev1.ConfigMap
@@ -282,5 +280,56 @@ func TestHomeAttachmentReportsOnlyItsOwnFailure(t *testing.T) {
 	got := getModel(t, r, model)
 	if readyReason(got) != reasonReconcileFailed || got.Status.Phase != modelPhaseFailed {
 		t.Fatalf("status = %q/%q, want %q", got.Status.Phase, readyReason(got), reasonReconcileFailed)
+	}
+}
+
+func TestRebindingAwayFromOwnTenantRemovesHomeRoute(t *testing.T) {
+	gatewayA := v1alpha1.NamespacedObjectReference{Name: "gw-a", Namespace: "gateway-a"}
+	provider, secret := attachmentProvider("tenant-a")
+	model := attachmentModel("chat", "tenant-a", "chat-model", time.Unix(100, 0))
+	sibling := attachmentModel("other", "tenant-a", "other-model", time.Unix(100, 0))
+	objects := []client.Object{provider, secret, model, sibling}
+	objects = append(objects, attachmentTenantObjects("tenant-a", "tenant-a", gatewayA, "praxis")...)
+	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	reconcileModel(t, r, sibling)
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", "external-model-chat"); err != nil {
+		t.Fatalf("model is not served through its own tenant first: %v", err)
+	}
+
+	got := getModel(t, r, model)
+	got.Spec.GatewayRefs = []v1alpha1.NamespacedObjectReference{gatewayB}
+	if err := r.Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
+
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", "external-model-chat"); !apierrors.IsNotFound(err) {
+		t.Fatalf("the old home route survived rebinding to another Gateway: %v", err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", "external-model-other"); err != nil {
+		t.Fatalf("a sibling's route was removed: %v", err)
+	}
+	if candidates := overlayEnvelope(t, r, "tenant-a").Overlay.Candidates; len(candidates) != 1 || candidates[0].Name != "other-model" {
+		t.Fatalf("own tenant overlay = %#v, want only the sibling", candidates)
+	}
+	if got := getModel(t, r, model); readyReason(got) != reasonAttachmentPending {
+		t.Fatalf("reason = %q, want the new attachment pending", readyReason(got))
+	}
+
+	// The last model leaving removes the tenant's own serving state.
+	got = getModel(t, r, sibling)
+	got.Spec.GatewayRefs = []v1alpha1.NamespacedObjectReference{gatewayB}
+	if err := r.Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, sibling)
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", "external-model-other"); !apierrors.IsNotFound(err) {
+		t.Fatalf("the last model's home route survived: %v", err)
+	}
+	var overlay corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); !apierrors.IsNotFound(err) {
+		t.Fatalf("own tenant overlay survived its last model leaving: %v", err)
 	}
 }

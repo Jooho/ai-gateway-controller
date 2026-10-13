@@ -10,6 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -38,6 +39,8 @@ const (
 	attachmentRequeueInterval = 5 * time.Second
 )
 
+var httpRouteGVK = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"}
+
 // attachmentTenant is the Praxis tenant that owns an attached Gateway.
 type attachmentTenant struct {
 	gateway   v1alpha1.NamespacedObjectReference
@@ -63,6 +66,12 @@ func gatewayKey(gateway v1alpha1.NamespacedObjectReference) string {
 
 func hasGatewayRef(model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference) bool {
 	return slices.Contains(model.Spec.GatewayRefs, gateway)
+}
+
+func newHTTPRoute() *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(httpRouteGVK)
+	return u
 }
 
 // gatewayAttachedModels enqueues models attached to the AITenant's Gateway.
@@ -190,6 +199,8 @@ func (r *Reconciler) reconcileAttachedModel(ctx context.Context, model *v1alpha1
 		if homeErr != nil {
 			errs = append(errs, homeErr)
 		}
+	} else if err := r.leaveHomeTenant(ctx, model); err != nil {
+		errs = append(errs, err)
 	}
 
 	for i, target := range targets {
@@ -281,6 +292,39 @@ func (r *Reconciler) writeAttachedStatus(ctx context.Context, model *v1alpha1.Ex
 	}
 	return r.setModelStatus(ctx, model, resolver.PhaseReady, true, reasonReconciled,
 		fmt.Sprintf("served through %d Gateway attachment(s)", len(results)), routeName)
+}
+
+// leaveHomeTenant republishes the model's own tenant without it when its
+// gatewayRefs no longer name that tenant's Gateway. The home state is kept
+// until the tenant is steady, as for any other home republish.
+func (r *Reconciler) leaveHomeTenant(ctx context.Context, model *v1alpha1.ExternalModel) error {
+	if hasHome, err := r.hasHomeRoute(ctx, model); err != nil || !hasHome {
+		return err
+	}
+	live, err := r.liveTenantResolution(ctx, model.Namespace)
+	if err != nil {
+		return err
+	}
+	if live.missingConfig || !live.selected || live.aitenant == nil || live.status != tenant.PayloadProcessingStatusSteady ||
+		!live.mtc.GetDeletionTimestamp().IsZero() || !live.aitenant.GetDeletionTimestamp().IsZero() ||
+		!tenant.IsActive(live.aitenant) || !tenant.StatusIsCurrent(live.aitenant) {
+		return nil
+	}
+	gatewayName, gatewayNamespace, ok := tenant.GatewayRef(live.aitenant)
+	if !ok || tenant.ServedByTenantGateway(model, gatewayName, gatewayNamespace) {
+		// Still bound to its own tenant; the Gateway lookup was unresolved.
+		return nil
+	}
+	return r.republishHomeWithout(ctx, model, tenant.ID(live.aitenant.GetName()), gatewayName, gatewayNamespace)
+}
+
+// hasHomeRoute reports whether the model has its tenant-local HTTPRoute.
+func (r *Reconciler) hasHomeRoute(ctx context.Context, model *v1alpha1.ExternalModel) (bool, error) {
+	route := newHTTPRoute()
+	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: modelRouteName(model.Name)}, route); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	return route.GetLabels()["inference.opendatahub.io/external-model"] == model.Name, nil
 }
 
 // setModelStatus writes the model status with an explicit phase. The route
