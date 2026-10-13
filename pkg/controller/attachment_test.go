@@ -333,3 +333,43 @@ func TestRebindingAwayFromOwnTenantRemovesHomeRoute(t *testing.T) {
 		t.Fatalf("own tenant overlay survived its last model leaving: %v", err)
 	}
 }
+
+func TestRebindingAwayFromDeselectedTenantCleansHomeRoute(t *testing.T) {
+	gatewayA := v1alpha1.NamespacedObjectReference{Name: "gw-a", Namespace: "gateway-a"}
+	provider, secret := attachmentProvider("tenant-a")
+	model := attachmentModel("chat", "tenant-a", "chat-model", time.Unix(100, 0))
+	objects := []client.Object{provider, secret, model}
+	objects = append(objects, attachmentTenantObjects("tenant-a", "tenant-a", gatewayA, "praxis")...)
+	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", "external-model-chat"); err != nil {
+		t.Fatalf("model is not served through its own tenant first: %v", err)
+	}
+
+	// The tenant switches to IPP while the model is rebound elsewhere.
+	mtc := tenant.NewMaasTenantConfig()
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: tenant.MaasTenantConfigInstanceName}, mtc); err != nil {
+		t.Fatal(err)
+	}
+	annotations := mtc.GetAnnotations()
+	annotations[tenant.AnnotationPayloadProcessingType] = tenant.PayloadProcessingBackendIPP
+	mtc.SetAnnotations(annotations)
+	if err := r.Update(context.Background(), mtc); err != nil {
+		t.Fatal(err)
+	}
+	got := getModel(t, r, model)
+	got.Spec.GatewayRefs = []v1alpha1.NamespacedObjectReference{gatewayB}
+	if err := r.Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
+
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", "external-model-chat"); !apierrors.IsNotFound(err) {
+		t.Fatalf("the home route survived an explicit non-Praxis selection: %v", err)
+	}
+	var overlay corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); !apierrors.IsNotFound(err) {
+		t.Fatalf("the deselected tenant's overlay survived: %v", err)
+	}
+}

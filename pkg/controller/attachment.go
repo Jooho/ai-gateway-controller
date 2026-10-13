@@ -295,8 +295,9 @@ func (r *Reconciler) writeAttachedStatus(ctx context.Context, model *v1alpha1.Ex
 }
 
 // leaveHomeTenant republishes the model's own tenant without it when its
-// gatewayRefs no longer name that tenant's Gateway. The home state is kept
-// until the tenant is steady, as for any other home republish.
+// gatewayRefs no longer name that tenant's Gateway. As on the home path, an
+// explicit non-Praxis selection cleans up; otherwise the home state is kept
+// until the tenant is steady.
 func (r *Reconciler) leaveHomeTenant(ctx context.Context, model *v1alpha1.ExternalModel) error {
 	if hasHome, err := r.hasHomeRoute(ctx, model); err != nil || !hasHome {
 		return err
@@ -305,7 +306,15 @@ func (r *Reconciler) leaveHomeTenant(ctx context.Context, model *v1alpha1.Extern
 	if err != nil {
 		return err
 	}
-	if live.missingConfig || !live.selected || live.aitenant == nil || live.status != tenant.PayloadProcessingStatusSteady ||
+	if live.missingConfig {
+		return nil
+	}
+	if !live.selected {
+		// An explicit non-Praxis selection is the home path's cleanup
+		// command; it does not wait for a steady tenant.
+		return r.cleanupUnselectedModel(ctx, model)
+	}
+	if live.aitenant == nil || live.status != tenant.PayloadProcessingStatusSteady ||
 		!live.mtc.GetDeletionTimestamp().IsZero() || !live.aitenant.GetDeletionTimestamp().IsZero() ||
 		!tenant.IsActive(live.aitenant) || !tenant.StatusIsCurrent(live.aitenant) {
 		return nil
